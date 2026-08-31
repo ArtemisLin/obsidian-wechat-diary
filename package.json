@@ -1,0 +1,11 @@
+{
+  "name": "obsidian-wechat-diary",
+  "private": true,
+  "scripts": {
+    "test": "node tests/bindtest.js && node tests/webcliptest.js",
+    "verify": "npm test && node --check main.js && git diff --check"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0"
+  }
+}

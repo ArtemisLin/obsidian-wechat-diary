@@ -2362,6 +2362,17 @@ const OFFLINE_NOTICE_GAP_H = 24;   // 缓冲窗口 24h 内实测可补收(2026-0
 
 const DEFAULT_SETTINGS = {
   diaryFolder: "日记",
+  // 默认只抓公众号链接；其它站点需用户主动打开扩展开关。
+  webClipEnabled: true,
+  webClipOtherSites: false,
+  // 空值表示跟随 <日记文件夹>/剪藏；用户填入后才固定为自定义目录。
+  webClipFolder: "",
+  // 只下载正文容器里的栅格图, 落进剪藏附件目录并改写为本地 Obsidian embed。
+  webClipSaveImages: true,
+  webClipMaxImages: 30,
+  webClipMaxTotalImageMb: 50,
+  // 防异常网页把 vault 撑爆。约 20 万汉字已远超通常长文, 超出部分会明确标注截断。
+  webClipMaxChars: 200000,
   timezone: "Asia/Shanghai",
   aiApiUrl: "",
   aiModel: "",
@@ -2632,6 +2643,7 @@ function helpText(shared, heading, dayStartHour) {
 // 撤回回执带被撤内容预览: 用户要能确认撤对了。纯字符串, 不需要 AI。
 function undoOkReply(removed) {
   if (!removed) return "好的, 帮你撤回啦";
+  if (/\[\[[^\]\n]+\|🔖\s/.test(removed)) return "好的, 撤掉了刚才那条网页，剪藏文件还在";
   if (removed.startsWith("🎤 ![[")) return "好的, 撤掉了刚才那条语音";
   if (removed.startsWith("![[")) {
     const low = removed.toLowerCase();
@@ -3166,11 +3178,883 @@ class ChatHandler {
   }
 }
 
+// ── 网页正文剪藏(纯本地规则, 不调用 AI)──────────────────────────────────
+
+const WEB_CLIP_FETCH_TIMEOUT_MS = 30000;
+const WEB_CLIP_IMAGE_TIMEOUT_MS = 10000;
+const WEB_CLIP_TOTAL_BUDGET_MS = 75000;
+const WEB_CLIP_IMAGE_CONCURRENCY = 4;
+const WEB_CLIP_MAX_HTML_BYTES = 5 * 1024 * 1024;
+const WEB_CLIP_MAX_IMAGE_BYTES = 15 * 1024 * 1024;
+const WEB_CLIP_DEFAULT_MAX_IMAGES = 30;
+const WEB_CLIP_HARD_MAX_IMAGES = 100;
+const WEB_CLIP_DEFAULT_MAX_TOTAL_IMAGE_MB = 50;
+const WEB_CLIP_MIN_TOTAL_IMAGE_MB = 15;
+const WEB_CLIP_HARD_MAX_TOTAL_IMAGE_MB = 500;
+const WEB_CLIP_MAX_LINKS_PER_MESSAGE = 3;
+const WEB_CLIP_MIN_TEXT_CHARS = 40;
+const WEB_URL_RE = /https?:\/\/[^\s<>"'，。！？；：、（）【】《》「」『』〔〕〈〉]+/gi;
+const WEB_CLIP_BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
+
+function defaultWebClipFolder(settings) {
+  return normalizePath(((settings && settings.diaryFolder) || "日记") + "/剪藏");
+}
+
+function webClipMaxImages(settings) {
+  const configured = Number(settings && settings.webClipMaxImages);
+  return Number.isFinite(configured)
+    ? Math.max(0, Math.min(WEB_CLIP_HARD_MAX_IMAGES, Math.floor(configured)))
+    : WEB_CLIP_DEFAULT_MAX_IMAGES;
+}
+
+function webClipMaxTotalImageBytes(settings) {
+  const configured = Number(settings && settings.webClipMaxTotalImageMb);
+  const mb = Number.isFinite(configured)
+    ? Math.max(WEB_CLIP_MIN_TOTAL_IMAGE_MB, Math.min(WEB_CLIP_HARD_MAX_TOTAL_IMAGE_MB, Math.floor(configured)))
+    : WEB_CLIP_DEFAULT_MAX_TOTAL_IMAGE_MB;
+  return mb * 1024 * 1024;
+}
+
+function normalizeWebUrl(raw) {
+  try {
+    const u = new URL(String(raw || "").trim());
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    if (u.username || u.password) return null;
+    u.hash = ""; // 页面锚点不影响正文, 去掉后同一篇文章可稳定去重
+    return u.toString();
+  } catch (e) { return null; }
+}
+
+function isWechatArticleUrl(raw) {
+  const normalized = normalizeWebUrl(raw);
+  if (!normalized) return false;
+  try { return new URL(normalized).hostname.toLowerCase() === "mp.weixin.qq.com"; }
+  catch (e) { return false; }
+}
+
+function shouldClipWebUrl(raw, settings) {
+  return isWechatArticleUrl(raw) || Boolean(settings && settings.webClipOtherSites === true);
+}
+
+function trimUrlTail(raw) {
+  let s = String(raw || "");
+  // 中文闭合标点和句末标点不会是 URL 的合法必要尾巴。
+  s = s.replace(/[，。！？；：、）】》」』〕〉]+$/g, "");
+  s = s.replace(/[.,!?;:]+$/g, "");
+  // 英文右括号只有在数量多于左括号时才当聊天标点剥掉, 保住 Wikipedia 常见的 (...) URL。
+  while (s.endsWith(")") && (s.match(/\)/g) || []).length > ((s.match(/\(/g) || []).length)) s = s.slice(0, -1);
+  return s;
+}
+
+function extractWebUrls(text) {
+  const out = [];
+  const seen = new Set();
+  for (const m of String(text || "").matchAll(WEB_URL_RE)) {
+    const u = normalizeWebUrl(trimUrlTail(m[0]));
+    if (u && !seen.has(u)) { seen.add(u); out.push(u); }
+  }
+  return out;
+}
+
+function linkNoteFromText(text, urls) {
+  let note = String(text || "");
+  for (const u of urls || []) {
+    // 同时去规范化前后的原串: URL() 可能补尾斜线。
+    note = note.split(u).join(" ");
+    const noSlash = u.endsWith("/") ? u.slice(0, -1) : u;
+    if (noSlash) note = note.split(noSlash).join(" ");
+  }
+  note = note.replace(WEB_URL_RE, " ").replace(/^[\s，。！？；：、:：-]+|[\s，。！？；：、:：-]+$/g, "");
+  return note.replace(/\s+/g, " ").trim();
+}
+
+function isPrivateIpv4(host) {
+  const p = String(host || "").split(".");
+  if (p.length !== 4 || p.some((x) => !/^\d+$/.test(x) || Number(x) > 255)) return false;
+  const a = p.map(Number);
+  return a[0] === 0 || a[0] === 10 || a[0] === 127 ||
+    (a[0] === 100 && a[1] >= 64 && a[1] <= 127) ||
+    (a[0] === 169 && a[1] === 254) ||
+    (a[0] === 172 && a[1] >= 16 && a[1] <= 31) ||
+    (a[0] === 192 && (a[1] === 0 || a[1] === 168)) ||
+    (a[0] === 198 && (a[1] === 18 || a[1] === 19)) || a[0] >= 224;
+}
+
+function isUnsafeWebUrl(raw) {
+  const normalized = normalizeWebUrl(raw);
+  if (!normalized) return true;
+  const u = new URL(normalized);
+  const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!h || h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal") ||
+      h.endsWith(".lan") || h.endsWith(".home.arpa")) return true;
+  if (isPrivateIpv4(h)) return true;
+  // IPv4-mapped IPv6、loopback、link-local、ULA。
+  if (h === "::" || h === "::1" || h.startsWith("::ffff:") || h.startsWith("fe8") || h.startsWith("fe9") ||
+      h.startsWith("fea") || h.startsWith("feb") || h.startsWith("fc") || h.startsWith("fd")) return true;
+  // 单标签主机名通常是局域网服务。公网域名、IPv6 和 .onion 都有点或冒号。
+  if (!h.includes(".") && !h.includes(":")) return true;
+  return false;
+}
+
+function decodeHtmlEntities(text) {
+  const named = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", ndash: "–", mdash: "—", hellip: "…", copy: "©", reg: "®" };
+  return String(text || "").replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]+);/gi, (all, key) => {
+    if (key[0] === "#") {
+      const hex = key[1].toLowerCase() === "x";
+      const n = parseInt(key.slice(hex ? 2 : 1), hex ? 16 : 10);
+      try { return Number.isFinite(n) ? String.fromCodePoint(n) : all; } catch (e) { return all; }
+    }
+    return Object.prototype.hasOwnProperty.call(named, key.toLowerCase()) ? named[key.toLowerCase()] : all;
+  });
+}
+
+function htmlAttr(tag, name) {
+  const re = new RegExp("(?:^|\\s)" + name.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&") + "\\s*=\\s*(?:\\\"([^\\\"]*)\\\"|'([^']*)'|([^\\s>]+))", "i");
+  const m = re.exec(tag || "");
+  return m ? decodeHtmlEntities(m[1] != null ? m[1] : (m[2] != null ? m[2] : m[3])) : "";
+}
+
+function metaFromHtml(html, keys) {
+  for (const tag of String(html || "").match(/<meta\b[^>]*>/gi) || []) {
+    const id = (htmlAttr(tag, "property") || htmlAttr(tag, "name") || htmlAttr(tag, "itemprop")).toLowerCase();
+    if (keys.includes(id)) return htmlAttr(tag, "content").trim();
+  }
+  return "";
+}
+
+function absoluteHttpUrl(raw, baseUrl) {
+  try {
+    const u = new URL(raw, baseUrl);
+    return (u.protocol === "http:" || u.protocol === "https:") ? u.toString() : "";
+  } catch (e) { return ""; }
+}
+
+function cleanMarkdown(md) {
+  const codeBlocks = [];
+  let source = String(md || "").replace(/\u00a0/g, " ");
+  // 先保护插件生成的 fenced code，普通空白清理不能碰代码缩进和空行。
+  source = source.replace(/(^|\n)(`{3,}|~{3,})[^\n]*\n[\s\S]*?\n\2(?=\n|$)/g, (block) => {
+    const token = "\u0000WEBCLIP_CODE_" + codeBlocks.length + "\u0000";
+    codeBlocks.push(block.replace(/^\n|\n$/g, ""));
+    return "\n" + token + "\n";
+  });
+  source = source.split("\n").map((line) => {
+    const trimmedEnd = line.replace(/[ \t]+$/g, "");
+    // 列表的行首空白是层级，不得抹掉；其它 HTML 排版空白不应变成代码块。
+    if (/^[ \t]+(?:[-+*]|\d+[.)])\s/.test(trimmedEnd)) return trimmedEnd;
+    return trimmedEnd.replace(/^[ \t]+/g, "").replace(/[ \t]{2,}/g, " ");
+  }).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return source.replace(/\u0000WEBCLIP_CODE_(\d+)\u0000/g, (_, i) => codeBlocks[Number(i)] || "").trim();
+}
+
+function escapeWebText(value) {
+  return String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t\f\v]+/g, " ")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/!\[/g, "!\\[")
+    .replace(/\[\[/g, "\\[\\[")
+    .replace(/\]\]/g, "\\]\\]")
+    .replace(/%%/g, "\\%\\%")
+    .replace(/(^|\n)([ \t]*)(\d+)([.)])(?=\s)/g, "$1$2$3\\$4")
+    .replace(/(^|\n)([ \t]*)(`{3,}|~{3,}|#{1,6}(?=\s)|[-+*](?=\s)|>(?=\s))/g, "$1$2\\$3");
+}
+
+// 文本节点分别转义后仍可能在 DOM 边界拼出 ![ 或 [[。这里对最终正文再收口一次；
+// 插件自己的图片仍是 %%WECHAT_DIARY_IMAGE_n%% 占位，不会被误伤。
+function hardenWebMarkdown(value) {
+  return String(value || "")
+    .replace(/(^|[^\\])!\[/g, "$1!\\[")
+    .replace(/(^|[^\\])\[\[/g, "$1\\[\\[");
+}
+
+function fencedWebCode(value) {
+  const code = String(value || "").replace(/\r\n?/g, "\n").replace(/^\n+|\n+$/g, "");
+  if (!code) return "";
+  let longest = 0;
+  for (const m of code.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return "\n\n" + fence + "\n" + code + "\n" + fence + "\n\n";
+}
+
+function tableToMarkdown(table) {
+  const rows = [...table.querySelectorAll("tr")].map((tr) => [...tr.querySelectorAll(":scope > th, :scope > td")]
+    .map((c) => escapeWebText(c.textContent || "").replace(/\n+/g, " ").trim().replace(/\|/g, "\\|"))).filter((r) => r.length);
+  if (!rows.length) return "";
+  const width = Math.max(...rows.map((r) => r.length));
+  for (const r of rows) while (r.length < width) r.push("");
+  const out = ["| " + rows[0].join(" | ") + " |", "| " + rows[0].map(() => "---").join(" | ") + " |"];
+  for (const r of rows.slice(1)) out.push("| " + r.join(" | ") + " |");
+  return "\n\n" + out.join("\n") + "\n\n";
+}
+
+function webClipImageToken(index) { return "%%WECHAT_DIARY_IMAGE_" + index + "%%"; }
+
+function srcFromSrcset(srcset) {
+  const parts = String(srcset || "").split(",").map((x) => x.trim()).filter(Boolean);
+  if (!parts.length) return "";
+  return parts[parts.length - 1].split(/\s+/)[0] || "";
+}
+
+function collectWebClipImage(images, rawUrl, alt, baseUrl) {
+  const raw = String(rawUrl || "").trim();
+  if (!raw || raw === "null" || raw === "undefined" || raw === "#" || raw === "about:blank") return "";
+  const url = absoluteHttpUrl(raw, baseUrl);
+  if (!url) return "";
+  let i = images.findIndex((x) => x.url === url);
+  if (i < 0) {
+    i = images.length;
+    images.push({ url, alt: escapeWebText(alt || "").replace(/\n+/g, " ").replace(/[\[\]]/g, ""), token: webClipImageToken(i) });
+  } else if (!images[i].alt && alt) {
+    images[i].alt = escapeWebText(alt).replace(/\n+/g, " ").replace(/[\[\]]/g, "");
+  }
+  return images[i].token;
+}
+
+function imageTokenFromDom(node, baseUrl, images) {
+  const width = Number(node.getAttribute("width") || 0);
+  const height = Number(node.getAttribute("height") || 0);
+  if ((width > 0 && width <= 2) || (height > 0 && height <= 2)) return "";
+  const raw = node.getAttribute("data-src") || node.getAttribute("data-original") ||
+    node.getAttribute("data-lazy-src") || node.getAttribute("data-url") ||
+    srcFromSrcset(node.getAttribute("data-srcset") || node.getAttribute("srcset")) || node.getAttribute("src");
+  return collectWebClipImage(images, raw, node.getAttribute("alt") || node.getAttribute("title") || "", baseUrl);
+}
+
+function imageTokenFromTag(tag, baseUrl, images) {
+  const width = Number(htmlAttr(tag, "width") || 0);
+  const height = Number(htmlAttr(tag, "height") || 0);
+  if ((width > 0 && width <= 2) || (height > 0 && height <= 2)) return "";
+  const raw = htmlAttr(tag, "data-src") || htmlAttr(tag, "data-original") ||
+    htmlAttr(tag, "data-lazy-src") || htmlAttr(tag, "data-url") ||
+    srcFromSrcset(htmlAttr(tag, "data-srcset") || htmlAttr(tag, "srcset")) || htmlAttr(tag, "src");
+  return collectWebClipImage(images, raw, htmlAttr(tag, "alt") || htmlAttr(tag, "title"), baseUrl);
+}
+
+function domNodeToMarkdown(node, baseUrl, images) {
+  if (!node) return "";
+  if (node.nodeType === 3) return escapeWebText(node.nodeValue || "");
+  if (node.nodeType !== 1) return "";
+  const tag = String(node.tagName || "").toLowerCase();
+  if (["script", "style", "noscript", "template", "svg", "canvas", "form", "button", "iframe"].includes(tag)) return "";
+  if (tag === "br") return "\n";
+  if (tag === "hr") return "\n\n---\n\n";
+  if (tag === "pre") {
+    return fencedWebCode(node.textContent || "");
+  }
+  if (tag === "table") return tableToMarkdown(node);
+  if (tag === "img") {
+    const token = imageTokenFromDom(node, baseUrl, images || []);
+    return token ? "\n\n" + token + "\n\n" : "";
+  }
+  let inner = "";
+  for (const child of node.childNodes || []) inner += domNodeToMarkdown(child, baseUrl, images);
+  if (!inner.trim()) return "";
+  if (/^h[1-6]$/.test(tag)) return "\n\n" + "#".repeat(Number(tag[1])) + " " + cleanMarkdown(inner) + "\n\n";
+  if (tag === "p" || tag === "div" || tag === "section" || tag === "article" || tag === "main" || tag === "figure" || tag === "figcaption") {
+    return "\n\n" + inner.trim() + "\n\n";
+  }
+  if (tag === "blockquote") {
+    return "\n\n" + cleanMarkdown(inner).split("\n").map((l) => "> " + l).join("\n") + "\n\n";
+  }
+  if (tag === "strong" || tag === "b") return "**" + inner.trim() + "**";
+  if (tag === "em" || tag === "i") return "*" + inner.trim() + "*";
+  if (tag === "del" || tag === "s") return "~~" + inner.trim() + "~~";
+  if (tag === "code") return String.fromCharCode(96) + inner.trim().split(String.fromCharCode(96)).join("\\" + String.fromCharCode(96)) + String.fromCharCode(96);
+  if (tag === "a") {
+    const href = absoluteHttpUrl(node.getAttribute("href") || "", baseUrl);
+    const label = cleanMarkdown(inner).replace(/[\[\]]/g, "");
+    return href && label ? "[" + label + "](<" + href + ">)" : inner;
+  }
+  if (tag === "li") return "\n- " + cleanMarkdown(inner).replace(/\n/g, "\n  ");
+  if (tag === "ol") {
+    let i = 0;
+    const items = [...node.children].filter((c) => String(c.tagName).toLowerCase() === "li").map((li) => {
+      i += 1;
+      let body = ""; for (const c of li.childNodes) body += domNodeToMarkdown(c, baseUrl, images);
+      return i + ". " + cleanMarkdown(body).replace(/\n/g, "\n   ");
+    });
+    return "\n\n" + items.join("\n") + "\n\n";
+  }
+  if (tag === "ul") return "\n\n" + cleanMarkdown(inner) + "\n\n";
+  return inner;
+}
+
+const WEB_CLIP_REMOVE_SELECTOR = [
+  "script", "style", "noscript", "template", "svg", "canvas", "form", "button", "iframe",
+  "nav", "footer", "aside", "[aria-hidden='true']", ".advertisement", ".ads", ".ad", ".share",
+  ".social-share", ".related-posts", ".recommend-list", "#js_pc_qr_code", ".rich_media_tool",
+  "#js_article_bottom_bar", ".weui-dialog", ".rich_media_area_extra", ".rich_media_meta_list",
+  ".wx_follow_nickname", "#js_tags", "#js_minipro_dialog"
+].join(",");
+
+function textLen(node) {
+  if (!node) return 0;
+  const clone = node.cloneNode ? node.cloneNode(true) : null;
+  if (clone && typeof clone.querySelectorAll === "function") {
+    for (const el of clone.querySelectorAll("script,style,noscript,template")) el.remove();
+    return cleanMarkdown(clone.textContent || "").length;
+  }
+  return cleanMarkdown(node.textContent || "").length;
+}
+
+function chooseArticleRoot(doc) {
+  const selectors = [
+    "#js_content", "article", "main", "[role='main']", "[itemprop='articleBody']",
+    ".rich_media_content", ".article-content", ".article__content", ".post-content", ".entry-content",
+    ".content-article", ".article-body", ".post-body", ".markdown-body",
+  ];
+  const candidates = [], seen = new Set();
+  for (const sel of selectors) {
+    for (const el of doc.querySelectorAll(sel)) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      candidates.push(el);
+      // 明确正文容器一旦有足够正文就直接采用；公众号 #js_content 优先级最高。
+      if (textLen(el) >= WEB_CLIP_MIN_TEXT_CHARS) return el;
+    }
+  }
+  if (doc.body) candidates.push(doc.body);
+  let best = doc.body || doc.documentElement;
+  let bestScore = -Infinity;
+  for (const el of candidates) {
+    const len = textLen(el);
+    if (!len) continue;
+    let linkLen = 0;
+    for (const a of el.querySelectorAll("a")) linkLen += textLen(a);
+    const score = len - linkLen * 1.7 - (el === doc.body ? 150 : 0);
+    if (score > bestScore) { best = el; bestScore = score; }
+  }
+  return best;
+}
+
+function fallbackHtmlToMarkdown(html, baseUrl, images) {
+  let body = String(html || "");
+  const regions = [];
+  for (const tag of ["article", "main"]) {
+    const re = new RegExp("<" + tag + "\\b[^>]*>([\\s\\S]*?)<\\/" + tag + ">", "ig");
+    for (const m of body.matchAll(re)) regions.push(m[1]);
+  }
+  if (regions.length) body = regions.sort((a, b) => b.length - a.length)[0];
+  const codeBlocks = [];
+  body = body
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<(script|style|noscript|template|svg|canvas|form|nav|footer|aside|iframe)\b[\s\S]*?<\/\1>/gi, "")
+    .replace(/<pre\b[^>]*>([\s\S]*?)<\/pre>/gi, (_, code) => {
+      const token = "WEBCLIPPRETOKEN" + codeBlocks.length + "ENDTOKEN";
+      codeBlocks.push(fencedWebCode(decodeHtmlEntities(String(code).replace(/<[^>]+>/g, ""))));
+      return token;
+    });
+  // 只转义标签外的网页文本；插件随后生成的链接、标题、列表和图片占位不受影响。
+  body = body.split(/(<[^>]+>)/g).map((part) => part.startsWith("<")
+    ? part
+    : escapeWebText(decodeHtmlEntities(part))).join("");
+  body = body
+    .replace(/<img\b[^>]*>/gi, (tag) => {
+      const token = imageTokenFromTag(tag, baseUrl, images || []);
+      return token ? "\n\n" + token + "\n\n" : "";
+    })
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<hr\s*\/?>/gi, "\n\n---\n\n")
+    .replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi, (_, n, x) => "\n\n" + "#".repeat(Number(n)) + " " + x + "\n\n")
+    .replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, "\n- $1")
+    .replace(/<(p|div|section|blockquote|ul|ol|table|tr|figure|figcaption)\b[^>]*>/gi, "\n\n")
+    .replace(/<\/(p|div|section|blockquote|ul|ol|table|tr|figure|figcaption)>/gi, "\n\n")
+    .replace(/<strong\b[^>]*>([\s\S]*?)<\/strong>/gi, "**$1**")
+    .replace(/<b\b[^>]*>([\s\S]*?)<\/b>/gi, "**$1**")
+    .replace(/<em\b[^>]*>([\s\S]*?)<\/em>/gi, "*$1*")
+    .replace(/<i\b[^>]*>([\s\S]*?)<\/i>/gi, "*$1*")
+    .replace(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi, (_, attrs, label) => {
+      const href = absoluteHttpUrl(htmlAttr(attrs, "href"), baseUrl);
+      const clean = label.replace(/<[^>]+>/g, "").trim();
+      // 这里之后还要剥 HTML 标签, 不能使用 <url> 目的地(会被当标签删掉)。
+      return href && clean ? "[" + clean + "](" + href + ")" : clean;
+    })
+    .replace(/<[^>]+>/g, "");
+  let markdown = cleanMarkdown(body);
+  markdown = markdown.replace(/WEBCLIPPRETOKEN(\d+)ENDTOKEN/g, (_, i) => codeBlocks[Number(i)] || "");
+  return hardenWebMarkdown(cleanMarkdown(markdown));
+}
+
+function wechatPageVar(html, name) {
+  // 只接受真实的 var NAME = 声明，避免咬到 "__biz=" + biz + "&mid=" 之类的拼接诱饵。
+  // 公众号长链常见 var biz = "" || "Mz..."，因此允许一个空字面量加 || 的前缀。
+  const re = new RegExp("(?:^|[;{}>\\s])var\\s+" + escapeRegExp(name) +
+    "\\s*=\\s*(?:[\\\"']\\s*[\\\"']\\s*\\|\\|\\s*)?[\\\"']([^\\\"']+)[\\\"']", "im");
+  const m = re.exec(String(html || ""));
+  const value = m ? decodeHtmlEntities(m[1]).trim() : "";
+  if (!value) return "";
+  if (name === "biz" && !/^[A-Za-z0-9+/_-]{4,128}={0,2}$/.test(value)) return "";
+  if (name === "mid" && !/^\d{5,30}$/.test(value)) return "";
+  if (name === "idx" && !/^\d{1,3}$/.test(value)) return "";
+  return value;
+}
+
+function wechatPublishedFromHtml(html) {
+  const raw = wechatPageVar(html, "createTime");
+  if (!raw) return "";
+  if (/^\d{10,13}$/.test(raw)) {
+    const n = Number(raw) * (raw.length === 10 ? 1000 : 1);
+    const d = new Date(n);
+    if (Number.isFinite(d.getTime())) return d.toISOString();
+  }
+  return raw.replace(/\s+/g, " ").slice(0, 80);
+}
+
+function stripWechatTrackingParams(raw) {
+  const normalized = normalizeWebUrl(raw);
+  if (!normalized || !isWechatArticleUrl(normalized)) return normalized || raw;
+  const u = new URL(normalized);
+  if (/^\/s\/[^/]+/.test(u.pathname)) {
+    u.search = "";
+    return u.toString();
+  }
+  for (const key of ["chksm", "scene", "nwr_flag", "subscene", "clicktime", "enterid", "ascene", "devicetype", "version", "lang", "nettype", "exportkey", "pass_ticket", "wx_header", "from"]) {
+    u.searchParams.delete(key);
+  }
+  return u.toString();
+}
+
+function wechatArticleIdentityUrl(html, sourceUrl, canonicalUrl) {
+  if (!isWechatArticleUrl(sourceUrl) && !isWechatArticleUrl(canonicalUrl)) return normalizeWebUrl(canonicalUrl || sourceUrl) || String(canonicalUrl || sourceUrl || "");
+  const parsed = [];
+  for (const raw of [sourceUrl, canonicalUrl]) {
+    try { parsed.push(new URL(normalizeWebUrl(raw) || "")); }
+    catch (e) { /* 单个候选无效时继续 */ }
+  }
+  const validBiz = (v) => /^[A-Za-z0-9+/_-]{4,128}={0,2}$/.test(String(v || "")) ? String(v) : "";
+  const validMid = (v) => /^\d{5,30}$/.test(String(v || "")) ? String(v) : "";
+  const validIdx = (v) => /^\d{1,3}$/.test(String(v || "")) ? String(v) : "";
+  const firstParam = (names, validate) => {
+    for (const u of parsed) {
+      for (const name of names) {
+        const value = validate(u.searchParams.get(name));
+        if (value) return value;
+      }
+    }
+    return "";
+  };
+  // 明确 URL 参数优先于页面变量；页面脚本里可能含字符串拼接诱饵。
+  const biz = firstParam(["__biz", "biz"], validBiz) || wechatPageVar(html, "biz");
+  const mid = firstParam(["mid"], validMid) || wechatPageVar(html, "mid");
+  const idx = firstParam(["idx"], validIdx) || wechatPageVar(html, "idx");
+  if (biz && mid && idx) {
+    const u = new URL("https://mp.weixin.qq.com/s");
+    u.searchParams.set("__biz", biz);
+    u.searchParams.set("mid", mid);
+    u.searchParams.set("idx", idx);
+    return u.toString();
+  }
+  // 只有拿不到规范的 biz/mid/idx 时，才退回 /s/<id> 身份。
+  for (const u of parsed) {
+    const short = /^\/s\/([^/?#]+)/.exec(u.pathname);
+    if (short) return "https://mp.weixin.qq.com/s/" + short[1];
+  }
+  return stripWechatTrackingParams(canonicalUrl || sourceUrl);
+}
+
+function extractArticleFromHtml(html, sourceUrl, maxChars) {
+  html = String(html || "");
+  const images = [];
+  let title = "", author = "", published = "", site = "", description = "", canonical = sourceUrl, markdown = "";
+  if (typeof DOMParser !== "undefined") {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const meta = (...sels) => {
+      for (const sel of sels) { const el = doc.querySelector(sel); if (el && el.getAttribute("content")) return el.getAttribute("content").trim(); }
+      return "";
+    };
+    title = meta('meta[property="og:title"]', 'meta[name="twitter:title"]') || cleanMarkdown((doc.querySelector("h1") || {}).textContent || "") || cleanMarkdown(doc.title || "");
+    author = meta('meta[name="author"]', 'meta[property="article:author"]', 'meta[name="byl"]');
+    published = meta('meta[property="article:published_time"]', 'meta[name="publishdate"]', 'meta[itemprop="datePublished"]', 'meta[name="date"]') || wechatPublishedFromHtml(html);
+    site = meta('meta[property="og:site_name"]', 'meta[name="application-name"]');
+    description = meta('meta[property="og:description"]', 'meta[name="description"]', 'meta[name="twitter:description"]');
+    const canonicalEl = doc.querySelector('link[rel="canonical"]') || doc.querySelector('meta[property="og:url"]');
+    const canonicalRaw = canonicalEl && (canonicalEl.getAttribute("href") || canonicalEl.getAttribute("content"));
+    canonical = absoluteHttpUrl(canonicalRaw || "", sourceUrl) || sourceUrl;
+    const root = chooseArticleRoot(doc);
+    const clone = root && root.cloneNode(true);
+    if (clone) {
+      for (const el of clone.querySelectorAll(WEB_CLIP_REMOVE_SELECTOR)) el.remove();
+      markdown = cleanMarkdown(domNodeToMarkdown(clone, canonical || sourceUrl, images));
+    }
+  } else {
+    title = metaFromHtml(html, ["og:title", "twitter:title"]);
+    if (!title) {
+      const h1 = /<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(html);
+      const tm = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+      title = decodeHtmlEntities(((h1 && h1[1]) || (tm && tm[1]) || "").replace(/<[^>]+>/g, "")).trim();
+    }
+    author = metaFromHtml(html, ["author", "article:author", "byl"]);
+    published = metaFromHtml(html, ["article:published_time", "publishdate", "datepublished", "date"]) || wechatPublishedFromHtml(html);
+    site = metaFromHtml(html, ["og:site_name", "application-name"]);
+    description = metaFromHtml(html, ["og:description", "description", "twitter:description"]);
+    const can = /<link\b[^>]*rel=["']canonical["'][^>]*>/i.exec(html) || /<link\b[^>]*href=["'][^"']+["'][^>]*rel=["']canonical["'][^>]*>/i.exec(html);
+    canonical = absoluteHttpUrl(can ? htmlAttr(can[0], "href") : "", sourceUrl) || sourceUrl;
+    markdown = fallbackHtmlToMarkdown(html, canonical || sourceUrl, images);
+  }
+  title = cleanMarkdown(title).replace(/\s+/g, " ").slice(0, 240);
+  if (!title) {
+    try { title = new URL(sourceUrl).hostname; } catch (e) { title = "网页剪藏"; }
+  }
+  // 正文里常把文章标题再放一个 H1, 文件自己的 H1 已经会写一次, 去重但不碰不同的小标题。
+  const first = markdown.split("\n")[0] || "";
+  if (/^#\s+/.test(first) && cleanMarkdown(first.replace(/^#+\s*/, "")) === title) markdown = markdown.split("\n").slice(1).join("\n").trim();
+  const limit = Number.isFinite(Number(maxChars)) ? Math.max(1000, Number(maxChars)) : 200000;
+  const truncated = markdown.length > limit;
+  if (truncated) markdown = markdown.slice(0, limit).replace(/\s+\S*$/, "").trim();
+  markdown = hardenWebMarkdown(markdown);
+  canonical = stripWechatTrackingParams(canonical || sourceUrl);
+  const identityUrl = wechatArticleIdentityUrl(html, sourceUrl, canonical || sourceUrl);
+  return { title, author: cleanMarkdown(author), published: cleanMarkdown(published), site: cleanMarkdown(site),
+    description: cleanMarkdown(description), url: sourceUrl, canonicalUrl: canonical || sourceUrl, identityUrl, markdown, truncated, images };
+}
+
+function safeClipFilename(title) {
+  let s = cleanMarkdown(title || "网页剪藏").replace(/[\u0000-\u001f:*?"<>|#^/\\[\]]/g, "").replace(/\.+$/g, "").trim();
+  if (!s) s = "网页剪藏";
+  if ([...s].length > 60) s = [...s].slice(0, 60).join("");
+  while (Buffer.byteLength(s, "utf8") > 180 && [...s].length > 1) s = [...s].slice(0, -1).join("");
+  return s;
+}
+
+function webClipIdentityUrl(article) {
+  return normalizeWebUrl(article && (article.identityUrl || article.canonicalUrl || article.url)) ||
+    String(article && (article.identityUrl || article.canonicalUrl || article.url) || "");
+}
+
+function yamlString(value) { return JSON.stringify(String(value || "")); }
+
+function formatWebClipMarkdown(article, note, clippedAt) {
+  const title = article.title || "网页剪藏";
+  const displayTitle = escapeWebText(title).replace(/\n+/g, " ").trim() || "网页剪藏";
+  const sourceUrl = article.url || article.canonicalUrl || "";
+  const imageCount = Math.max(0, Number(article.imageCount) || 0);
+  const imageFailed = Math.max(0, Number(article.imageFailed) || 0);
+  const imageTotal = Math.max(imageCount + imageFailed, Number(article.imageTotal) || 0);
+  const lines = [
+    "---",
+    "title: " + yamlString(title),
+    "source_url: " + yamlString(sourceUrl),
+    "canonical_url: " + yamlString(article.canonicalUrl || sourceUrl),
+    "identity_url: " + yamlString(article.identityUrl || article.canonicalUrl || sourceUrl),
+    "source_site: " + yamlString(article.site || ""),
+    "author: " + yamlString(article.author || ""),
+    "published: " + yamlString(article.published || ""),
+    "clipped_at: " + yamlString(clippedAt || new Date().toISOString()),
+    "source: wechat-diary-web-clip",
+    "web_clip_image_total: " + imageTotal,
+    "web_clip_image_count: " + imageCount,
+    "web_clip_image_failed: " + imageFailed,
+    "tags:",
+    "  - 微信剪藏",
+    "---",
+    "",
+    "# " + displayTitle,
+    "",
+    "> [查看原文](<" + sourceUrl + ">)",
+  ];
+  if (article.author) lines.push("> 作者：" + escapeWebText(article.author).replace(/\n+/g, " "));
+  if (article.published) lines.push("> 发布：" + escapeWebText(article.published).replace(/\n+/g, " "));
+  if (article.site) lines.push("> 来源：" + escapeWebText(article.site).replace(/\n+/g, " "));
+  if (note) lines.push("", "## 微信附言", "", String(note).replace(/\r\n?/g, "\n").trim());
+  lines.push("", "## 正文", "", article.markdown || "_正文为空_", "");
+  if (imageFailed) {
+    lines.push("## 图片保存报告", "", "> [!warning] 有 " + imageFailed + " 张图片未能保存；正文中保留了可点击的原图地址。", "");
+    const failures = Array.isArray(article.imageFailures) ? article.imageFailures : [];
+    for (const failure of failures.slice(0, 20)) {
+      const reason = String((failure && failure.error) || "图片下载失败").replace(/[\r\n]+/g, " ").trim();
+      const failureUrl = normalizeWebUrl(failure && failure.url);
+      lines.push("- " + reason + (failureUrl ? " — [查看原图](<" + failureUrl + ">)" : ""));
+    }
+    if (failures.length > 20) lines.push("- 另有 " + (failures.length - 20) + " 项未展开");
+    lines.push("");
+  }
+  if (article.truncated) lines.push("> [!warning] 正文过长，已按插件上限截断；原文链接保留在上方。", "");
+  return lines.join("\n");
+}
+
+function responseHeader(headers, name) {
+  for (const k of Object.keys(headers || {})) if (k.toLowerCase() === name.toLowerCase()) return String(headers[k] || "");
+  return "";
+}
+
+function requestWebClipBinaryHop(url, headers, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let req = null;
+    let timer = null;
+    const chunks = [];
+    let total = 0;
+    const done = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) window.clearTimeout(timer);
+      fn(value);
+    };
+    try {
+      const parsed = new URL(url);
+      const transport = parsed.protocol === "https:" ? getHttps() : require("http");
+      req = transport.request(parsed, { method: "GET", headers }, (res) => {
+        const status = Number(res.statusCode || 0);
+        if (status >= 300 && status < 400 && res.headers.location) {
+          res.resume();
+          done(resolve, { redirect: new URL(res.headers.location, url).toString() });
+          return;
+        }
+        if (!(status >= 200 && status < 300)) {
+          res.resume();
+          done(reject, new Error("HTTP " + (status || "错误")));
+          return;
+        }
+        const announced = Number(res.headers["content-length"] || 0);
+        if (announced > WEB_CLIP_MAX_IMAGE_BYTES) {
+          res.resume();
+          done(reject, new Error("单张图片超过 15MB 上限"));
+          return;
+        }
+        res.on("data", (chunk) => {
+          if (settled) return;
+          total += chunk.length;
+          if (total > WEB_CLIP_MAX_IMAGE_BYTES) {
+            done(reject, new Error("单张图片超过 15MB 上限"));
+            try { req.destroy(); } catch (e) { /* noop */ }
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on("aborted", () => done(reject, new Error("图片下载中断")));
+        res.on("end", () => done(resolve, { status, headers: res.headers, buffer: Buffer.concat(chunks) }));
+      });
+      timer = window.setTimeout(() => {
+        done(reject, new Error("图片响应超时"));
+        try { req.destroy(); } catch (e) { /* noop */ }
+      }, Math.max(1, Number(timeoutMs) || WEB_CLIP_IMAGE_TIMEOUT_MS));
+      req.on("error", (e) => done(reject, e));
+      req.end();
+    } catch (e) {
+      done(reject, e);
+    }
+  });
+}
+
+async function requestWebClipBinaryDirect(rawUrl, headers, timeoutMs) {
+  let url = normalizeWebUrl(rawUrl);
+  if (!url || isUnsafeWebUrl(url)) throw new Error("图片地址不是公开 http/https URL");
+  const deadline = Date.now() + Math.max(1, Number(timeoutMs) || WEB_CLIP_IMAGE_TIMEOUT_MS);
+  for (let hop = 0; hop <= MEDIA_MAX_REDIRECTS; hop++) {
+    let result = null;
+    let lastError = null;
+    // 某些图片 CDN（实测 pbs.twimg.com）偶发在 TLS 建连前 ECONNRESET；短暂重试一次即可恢复。
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error("图片响应超时");
+        result = await requestWebClipBinaryHop(url, headers, remaining);
+        break;
+      } catch (e) {
+        lastError = e;
+        const message = String((e && e.message) || e);
+        const reset = e && e.code === "ECONNRESET" || /ECONNRESET/i.test(message);
+        if (attempt > 0 || !reset) throw e;
+        const delay = Math.min(200, Math.max(0, deadline - Date.now()));
+        if (!delay) throw new Error("图片响应超时");
+        await new Promise((resolve) => window.setTimeout(resolve, delay));
+      }
+    }
+    if (!result) throw lastError || new Error("图片直连失败");
+    if (!result.redirect) return result;
+    if (hop >= MEDIA_MAX_REDIRECTS) throw new Error("图片重定向过多");
+    url = normalizeWebUrl(result.redirect);
+    if (!url || isUnsafeWebUrl(url)) throw new Error("图片重定向到了非公开地址");
+  }
+  throw new Error("图片重定向过多");
+}
+
+class WebClipError extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+
+function isBlockedByClientError(error) {
+  return /ERR_BLOCKED_BY_CLIENT/i.test(String((error && error.message) || error || ""));
+}
+
+class WebClipper {
+  constructor(plugin, deps) {
+    this.plugin = plugin;
+    this._directImageRequest = deps && deps.directImageRequest ? deps.directImageRequest : requestWebClipBinaryDirect;
+  }
+
+  async _fetchImage(image, referer, timeoutMs) {
+    const url = normalizeWebUrl(image && image.url);
+    if (!url || isUnsafeWebUrl(url)) throw new WebClipError("unsafe_image", "图片地址不是公开 http/https URL");
+    const budget = Math.max(1, Math.min(WEB_CLIP_IMAGE_TIMEOUT_MS, Number(timeoutMs) || WEB_CLIP_IMAGE_TIMEOUT_MS));
+    const deadline = Date.now() + budget;
+    const imageHeaders = {
+      Accept: "image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.5",
+      Referer: referer,
+      "User-Agent": WEB_CLIP_BROWSER_UA,
+    };
+    let response;
+    let requestError = null;
+    // 优先走 Obsidian 请求层，遵循系统代理。只有 Electron 明确以
+    // ERR_BLOCKED_BY_CLIENT 拒绝跨域图片时，才退回桌面端 Node 直连。
+    try {
+      let timeoutId;
+      try {
+        response = await Promise.race([
+          requestUrl({
+            url, method: "GET", throw: false,
+            headers: { Accept: imageHeaders.Accept, "User-Agent": imageHeaders["User-Agent"] },
+          }),
+          new Promise((_, reject) => {
+            timeoutId = window.setTimeout(() => reject(new Error("图片响应超时")), budget);
+          }),
+        ]);
+      } finally {
+        if (timeoutId) window.clearTimeout(timeoutId);
+      }
+    } catch (e) {
+      requestError = e;
+    }
+    if (!response) {
+      if (!isBlockedByClientError(requestError)) {
+        throw new WebClipError("image_network", "图片无法访问: " + String((requestError && requestError.message) || requestError || "未知错误"));
+      }
+      try {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error("图片响应超时");
+        response = await this._directImageRequest(url, imageHeaders, remaining);
+      } catch (e) {
+        throw new WebClipError("image_network", "图片无法访问: " + String((e && e.message) || e));
+      }
+    }
+    const status = Number(response && response.status);
+    if (!(status >= 200 && status < 300)) throw new WebClipError("image_http", "图片返回 HTTP " + (status || "错误"));
+    const announced = Number(responseHeader(response.headers, "content-length"));
+    if (Number.isFinite(announced) && announced > WEB_CLIP_MAX_IMAGE_BYTES) {
+      throw new WebClipError("image_too_large", "单张图片超过 15MB 上限");
+    }
+    let buf = Buffer.alloc(0);
+    if (response.buffer) buf = Buffer.isBuffer(response.buffer) ? response.buffer : Buffer.from(response.buffer);
+    else if (response.arrayBuffer) buf = Buffer.from(response.arrayBuffer);
+    if (!buf.length) throw new WebClipError("image_empty", "图片没有返回内容");
+    if (buf.length > WEB_CLIP_MAX_IMAGE_BYTES) throw new WebClipError("image_too_large", "单张图片超过 15MB 上限");
+    const ext = sniffImageExt(buf);
+    if (!ext) throw new WebClipError("image_format", "图片格式无法识别");
+    return { ...image, url, buffer: buf, ext };
+  }
+
+  async fetchArticle(rawUrl) {
+    const deadline = Date.now() + WEB_CLIP_TOTAL_BUDGET_MS;
+    const url = normalizeWebUrl(rawUrl);
+    if (!url || isUnsafeWebUrl(url)) throw new WebClipError("unsafe", "只支持公开的 http/https 网页");
+    let res;
+    try {
+      const call = requestUrl({
+        url, method: "GET", throw: false,
+        headers: {
+          Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
+          "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+          "User-Agent": WEB_CLIP_BROWSER_UA,
+        },
+      });
+      let timeoutId;
+      try {
+        res = await Promise.race([
+          call,
+          new Promise((_, reject) => {
+            timeoutId = window.setTimeout(() => reject(new WebClipError("timeout", "网页响应超时")), WEB_CLIP_FETCH_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        if (timeoutId) window.clearTimeout(timeoutId);
+      }
+    } catch (e) {
+      if (e instanceof WebClipError) throw e;
+      throw new WebClipError("network", "网页无法访问: " + String((e && e.message) || e));
+    }
+    const status = Number(res && res.status);
+    if (!(status >= 200 && status < 300)) throw new WebClipError("http", "网页返回 HTTP " + (status || "错误"));
+    const type = responseHeader(res.headers, "content-type").toLowerCase();
+    if (type && !type.includes("text/html") && !type.includes("application/xhtml+xml")) {
+      throw new WebClipError("content_type", "这不是 HTML 网页 (" + type.split(";")[0] + ")");
+    }
+    let html = typeof res.text === "string" ? res.text : "";
+    if (!html && res.arrayBuffer) html = Buffer.from(res.arrayBuffer).toString("utf8");
+    if (!html) throw new WebClipError("empty", "网页没有返回内容");
+    if (Buffer.byteLength(html, "utf8") > WEB_CLIP_MAX_HTML_BYTES) throw new WebClipError("too_large", "网页源码超过 5MB 上限");
+    const article = extractArticleFromHtml(html, url, this.plugin.settings.webClipMaxChars);
+    const bodyText = cleanMarkdown(article.markdown
+      .replace(/!\[[^\]]*\]\(<[^>]+>\)/g, "")
+      .replace(/%%WECHAT_DIARY_IMAGE_\d+%%/g, ""));
+    if (!article.markdown || bodyText.length < WEB_CLIP_MIN_TEXT_CHARS) {
+      throw new WebClipError("no_text", "没找到足够的正文，网页可能需要登录或 JavaScript 渲染");
+    }
+    const referencedImages = (article.images || []).filter((image) => article.markdown.includes(image.token));
+    if (this.plugin.settings.webClipSaveImages === false) {
+      article.images = referencedImages.map((image) => ({ ...image, skipped: true }));
+      return article;
+    }
+    const maxImages = webClipMaxImages(this.plugin.settings);
+    const maxTotalImageBytes = webClipMaxTotalImageBytes(this.plugin.settings);
+    const maxTotalImageMb = Math.floor(maxTotalImageBytes / 1024 / 1024);
+    const downloaded = new Array(referencedImages.length);
+    for (let i = maxImages; i < referencedImages.length; i++) {
+      downloaded[i] = { ...referencedImages[i], error: "超过每篇 " + maxImages + " 张图片上限" };
+    }
+    let nextImage = 0;
+    const worker = async () => {
+      while (true) {
+        const i = nextImage++;
+        if (i >= Math.min(maxImages, referencedImages.length)) return;
+        const image = referencedImages[i];
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          downloaded[i] = { ...image, error: "超过 75 秒总时间预算，未下载" };
+          continue;
+        }
+        try {
+          downloaded[i] = await this._fetchImage(image, article.canonicalUrl || url, Math.min(WEB_CLIP_IMAGE_TIMEOUT_MS, remaining));
+        } catch (e) {
+          const reason = String((e && e.message) || e);
+          console.warn("[wechat-diary] 网页正文图片下载失败:", image.url, reason);
+          downloaded[i] = { ...image, error: reason };
+        }
+      }
+    };
+    const workers = Math.min(WEB_CLIP_IMAGE_CONCURRENCY, maxImages, referencedImages.length);
+    await Promise.all(Array.from({ length: workers }, () => worker()));
+    let totalBytes = 0;
+    for (let i = 0; i < downloaded.length; i++) {
+      const saved = downloaded[i];
+      if (!saved || !saved.buffer) continue;
+      if (totalBytes + saved.buffer.length > maxTotalImageBytes) {
+        downloaded[i] = { ...referencedImages[i], error: "正文图片合计超过 " + maxTotalImageMb + "MB 上限" };
+      } else {
+        totalBytes += saved.buffer.length;
+      }
+    }
+    article.images = downloaded;
+    return article;
+  }
+}
+
 // ── 日记写入(019 diary_writer.py 移植, 产出字节级一致; 宿主换成 vault API)─
 
 const HEADER_RE_G = /\*\*(\d{1,2}:\d{2})\*\*/g;
 const HEADER_FULL_RE = /^\*\*\d{1,2}:\d{2}\*\*$/;
 const NORMALIZE_BLANK_RE = /\n\s*\n+/g;
+
+// 日记消息块统一入口：CRLF、空行与契约保留前缀必须和 write() 完全一致，
+// 否则一次发送会被拆成多个块，或让撤回误删更早的内容。
+function normalizeDiaryBlockText(value, protectPrefix) {
+  let text = String(value || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+    .replace(NORMALIZE_BLANK_RE, "\n").trim();
+  if (protectPrefix !== false && (text.startsWith("# ") || text.startsWith("---") || text.startsWith("_("))) text = "\\" + text;
+  return text;
+}
 const CLOSING_MARKER = "_(今日封存于";
 
 function lastHeaderTime(content) {
@@ -3553,6 +4437,171 @@ class DiaryWriter {
     }
   }
 
+  webClipFolder() {
+    return normalizePath(this.plugin.settings.webClipFolder || defaultWebClipFolder(this.plugin.settings));
+  }
+
+  webClipPath(article, dateStr) {
+    const url = webClipIdentityUrl(article);
+    const hash = md5Hex(Buffer.from(url, "utf8")).slice(0, 10);
+    const name = dateStr + "-" + safeClipFilename(article.title) + "-" + hash + ".md";
+    return normalizePath(this.webClipFolder() + "/" + dateStr.slice(0, 4) + "/" + name);
+  }
+
+  webClipAssetFolder(article, dateStr) {
+    const url = webClipIdentityUrl(article);
+    const hash = md5Hex(Buffer.from(url, "utf8")).slice(0, 10);
+    return normalizePath(this.webClipFolder() + "/assets/" + dateStr.slice(0, 4) + "/" + dateStr + "-" + hash);
+  }
+
+  async _localizeWebClipImages(article, dateStr) {
+    const vault = this.plugin.app.vault;
+    const images = Array.isArray(article.images) ? article.images : [];
+    let markdown = String(article.markdown || "");
+    let imageCount = 0;
+    let imageFailed = 0;
+    const imageFailures = [];
+    const folder = this.webClipAssetFolder(article, dateStr);
+    for (let i = 0; i < images.length; i++) {
+      const image = images[i];
+      if (!image || !image.token || !markdown.includes(image.token)) continue;
+      let replacement = "";
+      if (image.buffer && image.ext) {
+        try {
+          const buf = Buffer.isBuffer(image.buffer) ? image.buffer : Buffer.from(image.buffer);
+          const name = String(i + 1).padStart(2, "0") + "-" + md5Hex(buf).slice(0, 10) + "." + image.ext;
+          const path = normalizePath(folder + "/" + name);
+          await this._ensureParents(path);
+          if (!vault.getAbstractFileByPath(path)) {
+            await vault.createBinary(path, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+          }
+          replacement = "![[" + path + "]]";
+          imageCount += 1;
+        } catch (e) {
+          console.error("[wechat-diary] 保存网页正文图片失败:", e);
+          imageFailed += 1;
+          imageFailures.push({ url: image.url || "", error: "写入 Vault 失败: " + String((e && e.message) || e) });
+        }
+      } else if (!image.skipped) {
+        imageFailed += 1;
+        imageFailures.push({ url: image.url || "", error: image.error || "图片下载失败" });
+      }
+      if (!replacement) {
+        const label = (image.skipped ? "查看原图：" : "图片未保存：") + (image.alt || "图片");
+        replacement = image.url ? "[" + label.replace(/[\[\]]/g, "") + "](<" + image.url + ">)" : "_" + label + "_";
+      }
+      markdown = markdown.split(image.token).join(replacement);
+    }
+    return { ...article, markdown, imageTotal: images.length, imageCount, imageFailed, imageFailures };
+  }
+
+  async _findWebClip(url) {
+    const normalized = normalizeWebUrl(url) || String(url || "");
+    const vault = this.plugin.app.vault;
+    if (!Array.isArray(this.plugin.data.webClips)) this.plugin.data.webClips = [];
+    const list = this.plugin.data.webClips;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const rec = list[i];
+      if (!rec || !rec.path || !vault.getAbstractFileByPath(rec.path)) {
+        list.splice(i, 1);
+        continue;
+      }
+      if (rec.url === normalized) return rec.path;
+    }
+    // data.json 被清掉也尽量不重复剪藏: 文件名末尾带 URL hash, 只读极少量候选核对 frontmatter。
+    const hash = md5Hex(Buffer.from(normalized, "utf8")).slice(0, 10);
+    const folder = this.webClipFolder() + "/";
+    const files = typeof vault.getMarkdownFiles === "function"
+      ? vault.getMarkdownFiles()
+      : (typeof vault.getFiles === "function" ? vault.getFiles() : []);
+    for (const f of files) {
+      if (!f || !f.path || !f.path.startsWith(folder) || !f.path.endsWith("-" + hash + ".md")) continue;
+      try {
+        const content = await vault.cachedRead(f);
+        if (content.includes("source_url: " + yamlString(normalized)) ||
+            content.includes("canonical_url: " + yamlString(normalized)) ||
+            content.includes("identity_url: " + yamlString(normalized))) return f.path;
+      } catch (e) { /* 单篇读失败不阻断其他候选 */ }
+    }
+    return "";
+  }
+
+  _rememberWebClip(url, path) {
+    const normalized = normalizeWebUrl(url) || String(url || "");
+    if (!Array.isArray(this.plugin.data.webClips)) this.plugin.data.webClips = [];
+    const list = this.plugin.data.webClips;
+    for (let i = list.length - 1; i >= 0; i--) if (list[i] && list[i].url === normalized) list.splice(i, 1);
+    list.push({ url: normalized, path });
+    if (list.length > 300) list.splice(0, list.length - 300);
+  }
+
+  // 只保存（或复用）一篇剪藏，不碰今日日记。多链接消息靠这个阶段先攒齐所有入口。
+  async saveWebClip(article, note, dateStr) {
+    const day = dateStr || logicalTodayStr();
+    const vault = this.plugin.app.vault;
+    const identityUrl = webClipIdentityUrl(article);
+    let path = await this._findWebClip(identityUrl);
+    let reused = Boolean(path);
+    // 早期同 URL 文件可能不含图片元数据。重新发送后若抓到更多图片，另存改进版，保留旧文件不覆盖。
+    const freshImageCount = (article.images || []).filter((image) => image && image.buffer).length;
+    if (path && freshImageCount) {
+      try {
+        const oldFile = vault.getFileByPath ? vault.getFileByPath(path) : vault.getAbstractFileByPath(path);
+        const oldContent = oldFile ? await vault.cachedRead(oldFile) : "";
+        const oldCountMatch = /^web_clip_image_count:\s*(\d+)/m.exec(oldContent);
+        const oldImageCount = oldCountMatch ? Number(oldCountMatch[1]) : -1;
+        if (freshImageCount > oldImageCount) { path = ""; reused = false; }
+      } catch (e) { /* 读不到旧文件时继续复用，避免误覆盖 */ }
+    }
+    let preparedArticle = article;
+    if (!path) {
+      path = this.webClipPath(article, day);
+      try {
+        preparedArticle = await this._localizeWebClipImages(article, day);
+        await this._ensureParents(path);
+        // URL hash 已让冲突极罕见; 真遇到同名用户文件时不覆盖, 加随机尾巴。
+        for (let i = 0; i < 5 && vault.getAbstractFileByPath(path); i++) path = path.replace(/\.md$/, "-" + randHex(4) + ".md");
+        await vault.create(path, formatWebClipMarkdown(preparedArticle, note));
+      } catch (e) {
+        console.error("[wechat-diary] 保存网页剪藏失败:", e);
+        return { path: "", title: article.title || "网页剪藏", reused: false, identityUrl,
+          diskFull: String(e && e.message).includes("ENOSPC") };
+      }
+    }
+    return { path, title: article.title || "网页剪藏", reused, identityUrl, diskFull: false,
+      imageCount: preparedArticle.imageCount || 0, imageFailed: preparedArticle.imageFailed || 0 };
+  }
+
+  // 把原句和一条或多条剪藏入口一次写成同一个消息块，保持段数和撤回边界稳定。
+  async appendWebClipEntries(entries, originalText, dateStr) {
+    const day = dateStr || logicalTodayStr();
+    const ready = (entries || []).filter((entry) => entry && entry.path);
+    if (!ready.length) return { n: 0, sealed: false, diskFull: false };
+    try {
+      const links = ready.map((entry) => {
+        const alias = ("🔖 " + (entry.title || "网页剪藏")).replace(/[|\[\]\r\n]/g, " ").replace(/\s+/g, " ").trim();
+        return "[[" + entry.path + "|" + alias + "]]";
+      });
+      const original = normalizeDiaryBlockText(originalText);
+      const block = (original ? [original, ...links] : links).join("\n");
+      const finalContent = await this._appendBlock(day, hhmmStr(), block);
+      for (const entry of ready) this._rememberWebClip(entry.identityUrl, entry.path);
+      return { n: countMessages(finalContent), sealed: finalContent.includes(CLOSING_MARKER), diskFull: false };
+    } catch (e) {
+      console.error("[wechat-diary] 网页剪藏入口写入日记失败:", e);
+      return { n: 0, sealed: false, diskFull: String(e && e.message).includes("ENOSPC") };
+    }
+  }
+
+  // 兼容单链接调用：保存剪藏后，原句和入口仍作为一个日记块落盘。
+  // 返回 {n, sealed, path, title, reused}; n===0 表示日记入口没写成。
+  async writeWebClip(article, originalText, note, dateStr) {
+    const saved = await this.saveWebClip(article, note, dateStr);
+    if (!saved.path) return { ...saved, n: 0, sealed: false };
+    const appended = await this.appendWebClipEntries([saved], originalText, dateStr);
+    return { ...saved, ...appended };
+  }
+
   // 附件与日记同根、按年分子目录: 日记/attachments/2026/2026-08-12-2104-a3f1.jpg
   attachmentPath(dateStr, ext) {
     const name = dateStr + "-" + hhmmStr().replace(":", "") + "-" + randHex(4) + "." + ext;
@@ -3834,12 +4883,8 @@ class DiaryWriter {
     const day = dateStr || logicalTodayStr();
 
     // 契约规则 6: 块内空行收敛为单个换行, 一次发送 = 一个块 = 一条消息
-    let polished = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(NORMALIZE_BLANK_RE, "\n").trim();
+    let polished = normalizeDiaryBlockText(text, !isVoice);
     if (isVoice) polished = "🎤 " + polished;
-    else if (polished.startsWith("# ") || polished.startsWith("---") || polished.startsWith("_(")) {
-      // 首行撞契约排除前缀会让整块"隐形"(不计数、undo 误删更早内容), 反斜杠转义
-      polished = "\\" + polished;
-    }
     const timestamp = hhmmStr();
 
     let finalContent;
@@ -4419,6 +5464,70 @@ class DiaryAgent {
     }
   }
 
+  async _clipLinks(text, urls, dateStr) {
+    this.session.last_activity_ts = Date.now();
+    const picked = (urls || []).slice(0, WEB_CLIP_MAX_LINKS_PER_MESSAGE);
+    const overflow = (urls || []).slice(WEB_CLIP_MAX_LINKS_PER_MESSAGE);
+    const note = linkNoteFromText(text, urls);
+    const clipReplies = [];
+    const failed = [];
+    const entries = [];
+    let writeN = 0;
+    let originalWritten = false;
+    let noteWritten = false;
+
+    for (const url of picked) {
+      try {
+        const article = await this.plugin.clipper.fetchArticle(url);
+        const res = await this.writer.saveWebClip(article, noteWritten ? "" : note, dateStr);
+        if (!res.path) {
+          failed.push({ url, reason: res.diskFull ? "磁盘空间不足" : "保存剪藏文件失败" });
+          continue;
+        }
+        entries.push(res);
+        if (!res.reused && note) noteWritten = true;
+        clipReplies.push(res.reused
+          ? "网页《" + res.title + "》之前存过，已复用 " + this.writer.webClipFolder() + " 中的剪藏"
+          : "网页《" + res.title + "》已存到 " + this.writer.webClipFolder() + " 文件夹");
+      } catch (e) {
+        console.error("[wechat-diary] 网页正文抓取失败:", e && e.message);
+        failed.push({ url, reason: (e && e.message) || "未知错误" });
+      }
+    }
+    for (const url of overflow) failed.push({ url, reason: "一条消息最多自动剪藏 " + WEB_CLIP_MAX_LINKS_PER_MESSAGE + " 个链接" });
+
+    // 所有成功入口攒齐后，与原句一次写成一个日记块。
+    if (entries.length) {
+      const appended = await this.writer.appendWebClipEntries(entries, text, dateStr);
+      if (appended.n) {
+        originalWritten = true;
+        writeN = appended.n;
+        this._noteWrite(appended.n, appended.sealed);
+      } else {
+        failed.push({ url: "", reason: appended.diskFull ? "磁盘空间不足，日记入口未写入" : "日记入口写入失败" });
+      }
+    }
+
+    // 全部剪藏失败时仍保留原句；入口写失败也尽量让原句不丢。
+    if (!originalWritten) {
+      const saved = await this.writer.write(text, false, dateStr);
+      if (saved.n) {
+        originalWritten = true;
+        writeN = saved.n;
+        this._noteWrite(saved.n, saved.sealed);
+      }
+    }
+
+    let reply = writeN ? "记下来啦~ 今天第 " + writeN + " 段 ✍️" : "⚠️ 原句没能写入日记，请稍后重发";
+    if (clipReplies.length) reply += "\n" + clipReplies.join("\n");
+    if (failed.length) {
+      const reason = failed.length === 1 ? failed[0].reason : failed.length + " 个链接未能提取";
+      reply += "\n⚠️ " + reason + "；" + (originalWritten ? "原句已记入今天的日记" : "请稍后重发");
+    }
+    if (writeN === 1) reply = FIRST_OF_DAY_PREFIX + reply + FIRST_OF_DAY_TIPS;
+    return reply;
+  }
+
   // 下载并写入一批图片。一张失败不连累其余。
   async _writeImages(images, dateStr) {
     this.session.last_activity_ts = Date.now();
@@ -4624,6 +5733,12 @@ class DiaryAgent {
         this.profile.state = "active";
         return RENAME_CONFIRM_TEMPLATE.split("{name}").join(newName);
       }
+    }
+
+    // 默认只剪藏公众号链接；其它网址保持原句记录，除非用户主动打开扩展开关。
+    if (!det.forced && !isVoice && this.plugin.settings.webClipEnabled !== false) {
+      const links = extractWebUrls(text).filter((url) => shouldClipWebUrl(url, this.plugin.settings));
+      if (links.length) return this._clipLinks(text, links);
     }
 
     // 「记：xx」逃生口: 剥掉前缀, xx 原样落库
@@ -5290,6 +6405,57 @@ class WechatDiarySettingTab extends PluginSettingTab {
         }));
     }
 
+    new Setting(containerEl).setName("链接剪藏").setHeading();
+    new Setting(containerEl)
+      .setName("自动提取公众号正文")
+      .setDesc("微信里发 mp.weixin.qq.com 公众号链接时，抓取标题、正文和正文图片保存为 Markdown；今日日记保留原句并另起一行放剪藏入口。")
+      .addToggle((t) => t.setValue(plugin.settings.webClipEnabled !== false)
+        .onChange(async (v) => { plugin.settings.webClipEnabled = v; await plugin.persist(); }));
+    new Setting(containerEl)
+      .setName("其他网站的链接也提取正文")
+      .setDesc("默认关闭。关闭时普通网址只按原句记进日记，不访问网页；开启后才尝试剪藏其它公开网站。")
+      .addToggle((t) => t.setValue(plugin.settings.webClipOtherSites === true)
+        .onChange(async (v) => { plugin.settings.webClipOtherSites = v; await plugin.persist(); }));
+    const defaultClipFolder = defaultWebClipFolder(plugin.settings);
+    new Setting(containerEl)
+      .setName("剪藏文件夹")
+      .setDesc("默认跟随日记文件夹，放在 <日记文件夹>/剪藏；留空即可恢复跟随")
+      .addText((t) => t.setPlaceholder(defaultClipFolder).setValue(plugin.settings.webClipFolder || defaultClipFolder)
+        .onChange(async (v) => { plugin.settings.webClipFolder = (v || "").trim(); await plugin.persist(); }));
+    new Setting(containerEl)
+      .setName("保存正文图片")
+      .setDesc("下载正文区域内的图片到剪藏文件夹 assets 目录，并在 Markdown 中使用本地 Obsidian 图片内链。单张图片上限 15MB。")
+      .addToggle((t) => t.setValue(plugin.settings.webClipSaveImages !== false)
+        .onChange(async (v) => { plugin.settings.webClipSaveImages = v; await plugin.persist(); }));
+    new Setting(containerEl)
+      .setName("每篇最多图片数")
+      .setDesc("范围 1–100，默认 30；超出的图片会保留原图链接和失败原因")
+      .addText((t) => {
+        t.inputEl.type = "number";
+        t.inputEl.min = "1";
+        t.inputEl.max = String(WEB_CLIP_HARD_MAX_IMAGES);
+        t.setValue(String(webClipMaxImages(plugin.settings))).onChange(async (v) => {
+          const n = Math.floor(Number(v));
+          if (!Number.isFinite(n) || n < 1 || n > WEB_CLIP_HARD_MAX_IMAGES) return;
+          plugin.settings.webClipMaxImages = n;
+          await plugin.persist();
+        });
+      });
+    new Setting(containerEl)
+      .setName("每篇图片总量上限（MB）")
+      .setDesc("范围 15–500，默认 50；包含大量动图的文章会占用更多 Vault 空间")
+      .addText((t) => {
+        t.inputEl.type = "number";
+        t.inputEl.min = String(WEB_CLIP_MIN_TOTAL_IMAGE_MB);
+        t.inputEl.max = String(WEB_CLIP_HARD_MAX_TOTAL_IMAGE_MB);
+        t.setValue(String(Math.floor(webClipMaxTotalImageBytes(plugin.settings) / 1024 / 1024))).onChange(async (v) => {
+          const n = Math.floor(Number(v));
+          if (!Number.isFinite(n) || n < WEB_CLIP_MIN_TOTAL_IMAGE_MB || n > WEB_CLIP_HARD_MAX_TOTAL_IMAGE_MB) return;
+          plugin.settings.webClipMaxTotalImageMb = n;
+          await plugin.persist();
+        });
+      });
+
     // 时区: 引擎支持就给完整 IANA 下拉, 不支持退回文本框
     const curTz = plugin.settings.timezone || "Asia/Shanghai";
     let tzList = [];
@@ -5500,6 +6666,8 @@ class WechatDiarySettingTab extends PluginSettingTab {
 
 const DEFAULT_DATA = () => ({
   settings: Object.assign({}, DEFAULT_SETTINGS),
+  // 最近剪藏 URL → vault 路径, 用于重复链接复用；文件名 hash 扫描是 data.json 丢失后的第二道兜底。
+  webClips: [],
   ilink: {
     botId: "", userId: "", baseUrl: "", buf: "",
     contextTokens: {}, recentSeqs: [], pauseUntil: 0, lastAliveTs: 0, loginTime: "",
@@ -5520,9 +6688,11 @@ const DEFAULT_DATA = () => ({
 class WechatDiaryPlugin extends Plugin {
   async onload() {
     const stored = (await this.loadData()) || {};
+    const storedSettings = stored.settings && typeof stored.settings === "object" ? stored.settings : {};
     const base = DEFAULT_DATA();
     this.data = {
-      settings: Object.assign(base.settings, stored.settings),
+      settings: Object.assign(base.settings, storedSettings),
+      webClips: Array.isArray(stored.webClips) ? stored.webClips : base.webClips,
       ilink: Object.assign(base.ilink, stored.ilink),
       profile: Object.assign(base.profile, stored.profile),
       session: Object.assign(base.session, stored.session),
@@ -5553,6 +6723,7 @@ class WechatDiaryPlugin extends Plugin {
 
     this.ai = new AiClient(this);
     this.writer = new DiaryWriter(this, this.ai);
+    this.clipper = new WebClipper(this);
     this.chatHandler = new ChatHandler(this.ai);
     this.agent = new DiaryAgent(this);
 
@@ -6184,13 +7355,16 @@ WechatDiaryPlugin.__internals = {
   parseImageAesKey, sniffImageExt, decryptAesEcb,
   INTENT, texts: { HELP_TEXT, NIGHT_SIGNOFF_TIP, FIRST_OF_DAY_PREFIX, FIRST_OF_DAY_TIPS, FIRST_OF_DAY_TIPS_NIGHT, FINALIZE_EMPTY_REPLY, FINALIZE_FAIL_REPLY, GRACE_EXPIRED_NOTICE, CLOSING_MARKER },
   pingReply, welcomeText, undoOkReply, logicalTodayStr, setDayStartHour, isNightNow, canMergeIntoLastHeader,
-  isUndoPhrase, signoffReply, nightSignoffTip, setNudgeNightHour, isLateNight, DiaryWriter,
+  isUndoPhrase, signoffReply, nightSignoffTip, setNudgeNightHour, isLateNight, DiaryWriter, DiaryAgent,
   reminderDue, reminderText, sniffAudioExt, md5Hex, pcmToWav, silkToWav, getSilkLib,
   // #15 路径层与共用文件模式
   renderPath, validatePathFormat, normalizeHeading, escapeRegExp, locateSection, spliceSection, appendSection,
   normalizeNewlines, trimBody, escapeHeadingLines, escapeFenceLines, renderTemplate, isForeignFile, removeLastBlock, sealContent,
   firstOfDayPrefixShared, stripFirstPrefix, expiredNoticeShared, welcomeTextShared, helpText, UNDO_FOREIGN_REPLY,
   DEFAULT_SETTINGS,
+  normalizeWebUrl, extractWebUrls, linkNoteFromText, isUnsafeWebUrl, extractArticleFromHtml,
+  defaultWebClipFolder, isWechatArticleUrl, shouldClipWebUrl, escapeWebText, webClipIdentityUrl,
+  safeClipFilename, formatWebClipMarkdown, requestWebClipBinaryDirect, webClipMaxImages, webClipMaxTotalImageBytes, WebClipper, WebClipError,
   texts2: { REMINDER_LINES, FILE_DUP_KEY_REPLY, FILE_TOO_BIG_REPLY, VOICE_FALLBACK_FAIL_REPLY,
     VIDEO_DUP_KEY_REPLY, VIDEO_TOO_BIG_REPLY, ATTACH_DISK_FULL_REPLY, REMINDER_TIME_RE },
 };

@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta property="og:title" content="公众号正文提取测试">
+  <meta property="og:site_name" content="微信公众平台">
+  <meta property="og:url" content="https://mp.weixin.qq.com/s?__biz=MzTest&amp;mid=2247480001&amp;idx=1&amp;sn=stable&amp;chksm=volatile">
+  <meta name="author" content="测试作者">
+  <title>公众号正文提取测试</title>
+  <script>
+    var biz = "" || "MzTest";
+    var mid = "2247480001";
+    var idx = "1";
+    var sn = "stable";
+    var concatBait = "https://mp.weixin.qq.com/s?__biz=" + biz + "&mid=" + mid + "&idx=" + idx;
+  </script>
+</head>
+<body id="activity-detail" class="zh_CN mm_appmsg">
+  <!-- 来自真实公众号页面的 DOM 层级，脚本与文章原文已剥除或改写为测试文本。 -->
+  <div id="js_article" class="rich_media">
+    <div class="rich_media_inner">
+      <div id="page-content" class="rich_media_area_primary">
+        <div class="rich_media_area_primary_inner">
+          <div id="img-content" class="rich_media_wrp">
+            <h1 id="activity-name" class="rich_media_title">公众号正文提取测试</h1>
+            <div id="meta_content" class="rich_media_meta_list">作者头像和发布日期噪音</div>
+            <div id="js_content" class="rich_media_content js_underline_content">
+              <p>这是公众号正文第一段，长度足以验证插件优先选择 js_content，而不是包含大量脚本文本的 body。</p>
+              <pre>def greet(name):
+    if name:
+        return "hello " + name</pre>
+              <ul><li>一级列表<ul><li>二级列表</li></ul></li></ul>
+              <p>危险文本：&lt;iframe src="https://evil.example"&gt;&lt;/iframe&gt; ![[secret]] %% 注释 %%</p>
+              <p>```dataviewjs 应当作为普通文字，不能打开可执行代码围栏。</p>
+              <table><tr><th>字段</th><th>值</th></tr><tr><td>危险表格</td><td>![[table-secret]]</td></tr></table>
+              <img data-src="https://mmbiz.qpic.cn/mmbiz_png/example/0" alt="正文配图">
+            </div>
+            <div class="rich_media_tool">微信扫一扫可打开此内容</div>
+            <div id="js_article_bottom_bar">在小说阅读器读本章</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="js_pc_qr_code">取消 允许</div>
+  <div class="weui-dialog">对话框噪音</div>
+</body>
+</html>
