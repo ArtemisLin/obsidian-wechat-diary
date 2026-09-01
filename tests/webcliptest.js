@@ -314,6 +314,7 @@ function fakeVault() {
       session: { reminder_streak: 0, last_activity_ts: 0 },
     },
     writer: {
+      firstPrefix: () => I.texts.FIRST_OF_DAY_PREFIX, // 真 writer 有此方法(共用模式换文案), 桩里给独立模式的常量
       webClipFolder: () => "日记/剪藏",
       saveWebClip: async (a, note) => {
         calls.clipped.push({ a, note });

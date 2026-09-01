@@ -4586,7 +4586,7 @@ class DiaryWriter {
       const block = (original ? [original, ...links] : links).join("\n");
       const finalContent = await this._appendBlock(day, hhmmStr(), block);
       for (const entry of ready) this._rememberWebClip(entry.identityUrl, entry.path);
-      return { n: countMessages(finalContent), sealed: finalContent.includes(CLOSING_MARKER), diskFull: false };
+      return { n: this._count(finalContent), sealed: finalContent.includes(CLOSING_MARKER), diskFull: false }; // _count: 外来文件只数我们段头后的块(回执=送达确认)
     } catch (e) {
       console.error("[wechat-diary] 网页剪藏入口写入日记失败:", e);
       return { n: 0, sealed: false, diskFull: String(e && e.message).includes("ENOSPC") };
@@ -5524,7 +5524,7 @@ class DiaryAgent {
       const reason = failed.length === 1 ? failed[0].reason : failed.length + " 个链接未能提取";
       reply += "\n⚠️ " + reason + "；" + (originalWritten ? "原句已记入今天的日记" : "请稍后重发");
     }
-    if (writeN === 1) reply = FIRST_OF_DAY_PREFIX + reply + FIRST_OF_DAY_TIPS;
+    if (writeN === 1) reply = this.writer.firstPrefix(dateStr) + reply + FIRST_OF_DAY_TIPS; // 共用模式的开页前缀带日期与节名
     return reply;
   }
 
@@ -6315,9 +6315,20 @@ class WechatDiarySettingTab extends PluginSettingTab {
     for (const fn of fns) { try { await fn(); } catch (e) { console.error("[wechat-diary] 设置页提交失败:", e && e.message); } }
   }
 
+  // 改下拉/开关会整页重建, 不保滚动位置就跳回顶部(issue #1 Roy 反馈, 2026-09-01 修):
+  // 重建前记下 scrollTop, 重建后立即恢复, 再补一帧(有些主题下高度在下一帧才稳定)
   display() {
     const { containerEl } = this;
     if (this._timers && this._timers.size) { this._flushLater().then(() => this.display()); return; }
+    const keepScroll = containerEl.scrollTop || 0;
+    this._render();
+    if (keepScroll) {
+      containerEl.scrollTop = keepScroll;
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => { containerEl.scrollTop = keepScroll; });
+    }
+  }
+  _render() {
+    const { containerEl } = this;
     containerEl.empty();
     const plugin = this.plugin;
 
