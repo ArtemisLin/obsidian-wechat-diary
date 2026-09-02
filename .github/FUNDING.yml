@@ -1,2 +1,2 @@
-# GitHub 仓库页顶部的 Sponsor 按钮指向 README 的「赞助」一节(微信赞赏码)
-custom: ["https://github.com/ArtemisLin/obsidian-wechat-diary#%E8%B5%9E%E5%8A%A9"]
+# GitHub 仓库页的 Sponsor 按钮: 直接打开微信赞赏码图片(README「赞助」一节同一张图)
+custom: ["https://raw.githubusercontent.com/ArtemisLin/obsidian-wechat-diary/main/docs/images/sponsor-wechat.jpg"]
