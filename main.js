@@ -6375,6 +6375,7 @@ class WechatDiarySettingTab extends PluginSettingTab {
     const PRESETS = {
       "YYYY/YYYY-MM-DD": "按年分文件夹 (2026/2026-08-30.md)",
       "YYYY/MM/YYYY-MM-DD": "按年/月分文件夹 (2026/08/2026-08-30.md)",
+      "YYYY/YYYY-MM/YYYY-MM-DD": "按年/年-月分文件夹 (2026/2026-08/2026-08-30.md, 月份文件夹不重名)", // issue #1 Roy 的布局
       "YYYY-MM-DD": "不分文件夹 (2026-08-30.md)",
     };
     const curFmt = st.pathFormat || DEFAULT_SETTINGS.pathFormat;
@@ -6390,7 +6391,7 @@ class WechatDiarySettingTab extends PluginSettingTab {
       return { ok: true, text: "今天会写到: " + plugin.writer._join(plugin.writer._root(), renderPath(v.value, todayD, moment) + ".md") };
     });
     fmtSetting.addDropdown((d) => {
-      const opts = Object.assign({}, PRESETS, { custom: "自定义…" });
+      const opts = Object.assign({}, PRESETS, { custom: "自定义… (任意 moment 格式, 如 YYYY/[W]ww/YYYY-MM-DD)" });
       d.addOptions(opts).setValue(fmtIsPreset ? curFmt : "custom")
         .onChange(async (v) => {
           if (v === "custom") { st._fmtCustom = true; this.display(); return; }
