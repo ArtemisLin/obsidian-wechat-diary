@@ -1495,6 +1495,21 @@ async function newPlugin(secrets, storedData) {
     I.setDayStartHour(4); I.setNudgeNightHour(22);
   }
 
+  console.log("\n【D14】默认值(2026-09-02 谷雨拍板): 剪藏默认关、语音原声默认开——全新安装与 0.3.1 老 data.json 升级两种路径都要落在默认值上");
+  {
+    check("D14 DEFAULT_SETTINGS.webClipEnabled === false", I.DEFAULT_SETTINGS.webClipEnabled === false, String(I.DEFAULT_SETTINGS.webClipEnabled));
+    check("D14 DEFAULT_SETTINGS.saveVoiceAudio === true", I.DEFAULT_SETTINGS.saveVoiceAudio === true, String(I.DEFAULT_SETTINGS.saveVoiceAudio));
+    const pFresh = await newPlugin({}, null);
+    check("D14 全新安装: 剪藏关", pFresh.settings.webClipEnabled === false, String(pFresh.settings.webClipEnabled));
+    check("D14 全新安装: 语音原声开", pFresh.settings.saveVoiceAudio === true, String(pFresh.settings.saveVoiceAudio));
+    // 0.3.1 用户的 data.json 里没有这两个键(剪藏是 0.4.0 才有的; 语音原声 D12 默认关时多数人没碰过开关)
+    const pOld = await newPlugin({}, { settings: { diaryFolder: "日记", timezone: "Asia/Shanghai", reminderEnabled: true, reminderTime: "21:30" } });
+    check("D14 老 data.json 升级: 没设过 → 剪藏关", pOld.settings.webClipEnabled === false, String(pOld.settings.webClipEnabled));
+    check("D14 老 data.json 升级: 没设过 → 语音原声开", pOld.settings.saveVoiceAudio === true, String(pOld.settings.saveVoiceAudio));
+    const pSet = await newPlugin({}, { settings: { diaryFolder: "日记", webClipEnabled: true, saveVoiceAudio: false } });
+    check("D14 用户明确设过的值不被默认值覆盖", pSet.settings.webClipEnabled === true && pSet.settings.saveVoiceAudio === false);
+  }
+
   console.log("\n────────────────────────");
   console.log(fail === 0 ? `全部通过 (${pass})` : `${pass} 通过, ${fail} 失败`);
   process.exit(fail === 0 ? 0 : 1);

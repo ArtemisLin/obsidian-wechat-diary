@@ -2362,8 +2362,9 @@ const OFFLINE_NOTICE_GAP_H = 24;   // 缓冲窗口 24h 内实测可补收(2026-0
 
 const DEFAULT_SETTINGS = {
   diaryFolder: "日记",
-  // 默认只抓公众号链接；其它站点需用户主动打开扩展开关。
-  webClipEnabled: true,
+  // 剪藏默认关(D14, 2026-09-02 谷雨拍板, 与 PR #2 收编条件「开关默认关」一致; 读取处一律 === true, 没设过=关)。
+  // 打开后也只抓公众号链接；其它站点需再打开扩展开关。
+  webClipEnabled: false,
   webClipOtherSites: false,
   // 空值表示跟随 <日记文件夹>/剪藏；用户填入后才固定为自定义目录。
   webClipFolder: "",
@@ -2385,9 +2386,9 @@ const DEFAULT_SETTINGS = {
   // 每日提醒(D10, 2026-08-19 谷雨拍板默认开): 到点时今天还什么都没记 → 微信上提醒一次。
   reminderEnabled: true,
   reminderTime: "21:30",
-  // 保存语音原声(D12, 2026-08-20 谷雨拍板: 开关型、默认关): 开了之后语音消息 = 原声 wav + 转写文字同块,
-  // 桌面端渲染成微信样式的语音气泡(点击即播)。默认关: 文字为主, 音频约 3MB/分钟计入库体积且被同步盘带走。
-  saveVoiceAudio: false,
+  // 保存语音原声(D12, 2026-08-20 谷雨拍板: 开关型、默认关 → D14, 2026-09-02 她拍板改为默认开): 开着时语音消息 = 原声 wav + 转写文字同块,
+  // 桌面端渲染成微信样式的语音气泡(点击即播)。关掉后只存文字。音频约 3MB/分钟计入库体积且被同步盘带走。
+  saveVoiceAudio: true,
   // #15 / D13 (2026-08-30): 路径可配置 + 写进已有的每日笔记。默认值渲染结果与 0.3.1 逐字相同(bindtest【G】黄金回归盯着)。
   pathFormat: "YYYY/YYYY-MM-DD",   // moment 格式, 相对日记文件夹; 英文字母是日期代码, 文件夹名放 [方括号]
   attachmentMode: "diary",         // diary(日记文件夹内 attachments/YYYY, 现状) | obsidian(跟随 Obsidian 附件设置) | custom(下面的文件夹)
@@ -5735,8 +5736,8 @@ class DiaryAgent {
       }
     }
 
-    // 默认只剪藏公众号链接；其它网址保持原句记录，除非用户主动打开扩展开关。
-    if (!det.forced && !isVoice && this.plugin.settings.webClipEnabled !== false) {
+    // 剪藏默认关(D14); 开了也只剪藏公众号链接，其它网址保持原句记录，除非用户主动打开扩展开关。
+    if (!det.forced && !isVoice && this.plugin.settings.webClipEnabled === true) {
       const links = extractWebUrls(text).filter((url) => shouldClipWebUrl(url, this.plugin.settings));
       if (links.length) return this._clipLinks(text, links);
     }
@@ -6420,8 +6421,8 @@ class WechatDiarySettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("链接剪藏").setHeading();
     new Setting(containerEl)
       .setName("自动提取公众号正文")
-      .setDesc("微信里发 mp.weixin.qq.com 公众号链接时，抓取标题、正文和正文图片保存为 Markdown；今日日记保留原句并另起一行放剪藏入口。")
-      .addToggle((t) => t.setValue(plugin.settings.webClipEnabled !== false)
+      .setDesc("默认关闭。开启后，微信里发 mp.weixin.qq.com 公众号链接时，抓取标题、正文和正文图片保存为 Markdown；今日日记保留原句并另起一行放剪藏入口。")
+      .addToggle((t) => t.setValue(plugin.settings.webClipEnabled === true)
         .onChange(async (v) => { plugin.settings.webClipEnabled = v; await plugin.persist(); }));
     new Setting(containerEl)
       .setName("其他网站的链接也提取正文")
@@ -6608,7 +6609,7 @@ class WechatDiarySettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("语音").setHeading();
     new Setting(containerEl)
       .setName("保存语音原声")
-      .setDesc("开启后, 之后收到的语音在转写成文字的同时把原声也存进附件, 笔记里显示成可点击播放的语音条(微信样式), 下面是文字。音频约 3MB/分钟, 计入库体积、会被同步盘带走。默认只存文字; 已存过的语音条不受开关影响, 始终显示为气泡。")
+      .setDesc("默认开启: 收到的语音在转写成文字的同时把原声也存进附件, 笔记里显示成可点击播放的语音条(微信样式), 下面是文字。音频约 3MB/分钟, 计入库体积、会被同步盘带走。关掉后只存文字; 已存过的语音条不受开关影响, 始终显示为气泡。")
       .addToggle((t) => t.setValue(!!plugin.settings.saveVoiceAudio)
         .onChange(async (v) => { plugin.settings.saveVoiceAudio = v; await plugin.persist(); }));
 
