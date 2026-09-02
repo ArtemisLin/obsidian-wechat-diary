@@ -139,6 +139,14 @@ frontmatter、`# 2026-08-12`、「今日计划」「晚间复盘」都来自你�
 
 前身 Python 常驻版 [wechat-diary](https://github.com/ArtemisLin/wechat-diary) 已归档(2026-08), 它写出的库遵循同一契约(只支持默认布局、独立文件), 本插件可直接接着写。
 
+## 赞助
+
+插件免费, 以后也不收费。它本身不经过任何 AI, 但它是用 Claude Code 写出来的, 设计、写码、每一轮审稿都要消耗大量 token, 之后的维护和新功能也一样。如果它对你有用, 愿意的话可以用微信扫下面的赞赏码, 赞助我一点 token, 金额随意。
+
+![谷雨的微信赞赏码, 用微信扫一扫即可赞助](docs/images/sponsor-wechat.jpg)
+
+这个码只有微信扫一扫能识别。不赞助也完全没关系, 提 issue、反馈问题、告诉朋友, 对这个插件同样是帮助。
+
 ## License
 
 本项目采用 **双许可(dual licensing)** 模式, 版权归作者 ArtemisLin 所有:

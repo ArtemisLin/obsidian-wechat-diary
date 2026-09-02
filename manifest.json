@@ -6,5 +6,6 @@
   "description": "Capture diary entries and quick notes by chatting to a WeChat bot. Text, voice, photos, files, and videos land in your vault as daily Markdown files.",
   "author": "GuYu",
   "authorUrl": "https://github.com/ArtemisLin",
+  "fundingUrl": "https://github.com/ArtemisLin/obsidian-wechat-diary#%E8%B5%9E%E5%8A%A9",
   "isDesktopOnly": true
 }
